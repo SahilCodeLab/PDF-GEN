@@ -3,135 +3,117 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const PDFDocument = require('pdfkit');
+const stream = require('stream');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
 app.use(cors());
 app.use(express.json());
 
-const models = [
-  {
-    name: "qwen/qwen3-coder:free",
-    key: process.env.OPENROUTER_API_KEY_1
-  },
-  {
-    name: "google/gemini-2.0-flash-exp:free",
-    key: process.env.OPENROUTER_API_KEY_2
-  }
-];
+app.post('/', async (req, res) => {
+  const { questions, subject, marks, geminiKey, pplxKey } = req.body;
 
-// 🧠 Define lengths based on marks
-const marksLengthMap = {
-  2: "Answer in 3-5 lines (~60 words).",
-  5: "Answer in 8-10 lines (~120 words).",
-  10: "Answer in 20-25 lines (~250-300 words) with examples.",
-  15: "Answer in 30-35 lines (~350+ words) with deep analysis and examples."
-};
+  const MARKS_LENGTH = {
+    2: { lines: 4, words: 60 },
+    5: { lines: 10, words: 120 },
+    10: { lines: 22, words: 280 },
+    15: { lines: 35, words: 330 },
+  };
 
-async function generateAnswer(question, marks) {
-  const instruction = `You are answering for a WBSU NEP Semester 2 student. Write exam-style answer. ${marksLengthMap[marks] || ''}\nQ: ${question}`;
+  const answerLength = MARKS_LENGTH[marks] || MARKS_LENGTH[5];
 
-  for (const model of models) {
+  const results = [];
+
+  for (const question of questions) {
+    const prompt = `Write an academic answer for this question in about ${answerLength.words} words:\n\nQ: ${question}\n\nAnswer:`;
+
+    let answer = '';
+    let modelUsed = 'None';
+
+    // 🧠 Gemini First
     try {
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
+      const geminiResp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${geminiKey || process.env.GEMINI_API_KEY}`,
         {
-          model: model.name,
-          messages: [
-            { role: 'user', content: instruction }
-          ]
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${model.key}`,
-            'Content-Type': 'application/json'
-          }
+          contents: [{ parts: [{ text: prompt }] }]
         }
       );
 
-      const answer = response.data.choices[0].message.content;
-      if (answer) return { answer, model: model.name };
+      answer = geminiResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      modelUsed = 'Google Gemini 2.0 Flash';
     } catch (err) {
-      console.warn(`⚠️ ${model.name} failed. Trying next...`);
+      // fallback
     }
-  }
 
-  return { answer: "❌ Answer generation failed.", model: "none" };
-}
+    // 🧠 Perplexity fallback
+    if (!answer && (pplxKey || process.env.PERPLEXITY_API_KEY)) {
+      try {
+        const perplexityResp = await axios.post(
+          'https://api.perplexity.ai/chat/completions',
+          {
+            model: "mistral-7b-instruct",
+            messages: [{ role: "user", content: prompt }]
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${pplxKey || process.env.PERPLEXITY_API_KEY}`,
+              "Content-Type": "application/json"
+            }
+          }
+        );
 
-// 🟢 Preview Route
-app.post('/generate-preview', async (req, res) => {
-  const { questions, subject, marks } = req.body;
+        answer = perplexityResp?.data?.choices?.[0]?.message?.content || '';
+        modelUsed = 'Perplexity AI';
+      } catch (err) {
+        answer = "❌ Answer generation failed.";
+        modelUsed = "none";
+      }
+    }
 
-  if (!questions || questions.length === 0) {
-    return res.status(400).json({ error: 'No questions provided.' });
-  }
-
-  const results = [];
-  for (let question of questions) {
-    const { answer, model } = await generateAnswer(question, marks);
-    results.push({ question, answer, model });
+    results.push({
+      question,
+      answer,
+      model: modelUsed
+    });
   }
 
   res.json(results);
 });
 
-// 🟢 PDF Download Route
-app.post('/download-pdf', async (req, res) => {
-  const { questions, subject, marks } = req.body;
-  if (!questions || questions.length === 0) {
-    return res.status(400).send('❌ No questions provided.');
-  }
+app.post('/pdf', async (req, res) => {
+  const { answers, subject } = req.body;
 
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader(
-    'Content-Disposition',
-    `attachment; filename="${(subject || 'WBSU_Answers').replace(/\s+/g, '_')}.pdf"`
-  );
+  const doc = new PDFDocument();
+  const bufferStream = new stream.PassThrough();
+  res.setHeader('Content-disposition', `attachment; filename=${subject || 'GeneratedAnswers'}.pdf`);
+  res.setHeader('Content-type', 'application/pdf');
+  doc.pipe(bufferStream);
 
-  const doc = new PDFDocument({
-    size: 'A4',
-    margins: { top: 50, bottom: 50, left: 50, right: 50 }
-  });
-  doc.pipe(res);
+  doc.fontSize(20).text(`Subject: ${subject || "Untitled"}`, { align: 'center' });
+  doc.moveDown();
 
-  doc.fontSize(18).text(`${subject || 'WBSU NEP'} - Answer Sheet`, { align: 'center' });
-  doc.moveDown(1.5);
+  answers.forEach((item, i) => {
+    doc.fontSize(14).fillColor('black').text(`Q${i + 1}: ${item.question}`, { bold: true });
+    doc.moveDown(0.5);
+    doc.fontSize(12).fillColor('gray').text(item.answer);
+    doc.moveDown(1.5);
 
-  for (let i = 0; i < questions.length; i++) {
-    const question = questions[i];
-    const { answer, model } = await generateAnswer(question, marks);
-
-    doc
-      .fontSize(14)
-      .fillColor('black')
-      .text(`Q${i + 1}: ${question}`, { underline: true })
-      .moveDown(0.5)
-      .fontSize(12)
-      .text(`Answer:\n${answer}`, { align: 'justify' })
-      .moveDown(0.5)
-      .fontSize(9)
-      .fillColor('gray')
-      .text(`Model used: ${model}`, { align: 'right' })
-      .moveDown(1);
-
-    // Watermark for every page
-    const watermark = 'Generated by SahilCodeLab';
-    doc.fontSize(40).fillColor('lightgray').opacity(0.2)
-      .rotate(45, { origin: [300, 400] })
-      .text(watermark, 100, 300, {
+    // Watermark
+    doc.fillColor('lightgray').fontSize(40).opacity(0.2)
+      .text('Generated by SahilCodeLab', {
         align: 'center',
-        width: 400
-      })
-      .rotate(-45)
-      .opacity(1)
-      .fillColor('black');
-  }
+        rotate: 0
+      });
+    doc.opacity(1);
+    doc.addPage();
+  });
 
   doc.end();
+  bufferStream.on("data", (chunk) => res.write(chunk));
+  bufferStream.on("end", () => res.end());
 });
 
-// 🟢 Start Server
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
