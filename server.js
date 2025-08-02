@@ -1,9 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 const axios = require('axios');
-const PDFDocument = require('pdfkit');
-const stream = require('stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,107 +10,121 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-app.post('/', async (req, res) => {
-  const { questions, subject, marks, geminiKey, pplxKey } = req.body;
+const DEFAULT_GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const DEFAULT_PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
 
-  const MARKS_LENGTH = {
-    2: { lines: 4, words: 60 },
-    5: { lines: 10, words: 120 },
-    10: { lines: 22, words: 280 },
-    15: { lines: 35, words: 330 },
-  };
-
-  const answerLength = MARKS_LENGTH[marks] || MARKS_LENGTH[5];
-
-  const results = [];
-
-  for (const question of questions) {
-    const prompt = `Write an academic answer for this question in about ${answerLength.words} words:\n\nQ: ${question}\n\nAnswer:`;
-
-    let answer = '';
-    let modelUsed = 'None';
-
-    // 🧠 Gemini First
-    try {
-      const geminiResp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${geminiKey || process.env.GEMINI_API_KEY}`,
-        {
-          contents: [{ parts: [{ text: prompt }] }]
-        }
-      );
-
-      answer = geminiResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      modelUsed = 'Google Gemini 2.0 Flash';
-    } catch (err) {
-      // fallback
-    }
-
-    // 🧠 Perplexity fallback
-    if (!answer && (pplxKey || process.env.PERPLEXITY_API_KEY)) {
-      try {
-        const perplexityResp = await axios.post(
-          'https://api.perplexity.ai/chat/completions',
-          {
-            model: "mistral-7b-instruct",
-            messages: [{ role: "user", content: prompt }]
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${pplxKey || process.env.PERPLEXITY_API_KEY}`,
-              "Content-Type": "application/json"
-            }
-          }
-        );
-
-        answer = perplexityResp?.data?.choices?.[0]?.message?.content || '';
-        modelUsed = 'Perplexity AI';
-      } catch (err) {
-        answer = "❌ Answer generation failed.";
-        modelUsed = "none";
+const fetchFromGemini = async (question, marks, key) => {
+  try {
+    const res = await axios.post(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent',
+      {
+        contents: [{ parts: [{ text: `Give a detailed ${marks} marks answer for:\n${question}` }] }],
+      },
+      {
+        params: { key: key },
+        headers: { 'Content-Type': 'application/json' },
       }
-    }
+    );
+    return res.data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+  } catch {
+    return null;
+  }
+};
 
-    results.push({
-      question,
-      answer,
-      model: modelUsed
-    });
+const fetchFromPerplexity = async (question, marks, key) => {
+  try {
+    const res = await axios.post(
+      'https://api.perplexity.ai/chat/completions',
+      {
+        model: 'pplx-70b-online',
+        messages: [{ role: 'user', content: `Give a detailed ${marks} marks answer for:\n${question}` }],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+    return res.data.choices?.[0]?.message?.content || null;
+  } catch {
+    return null;
+  }
+};
+
+const generateAnswer = async (question, marks, keys) => {
+  // Gemini try
+  if (keys.gemini) {
+    const answer = await fetchFromGemini(question, marks, keys.gemini);
+    if (answer) return { answer, model: 'Gemini' };
   }
 
-  res.json(results);
-});
+  // Perplexity fallback
+  if (keys.perplexity) {
+    const answer = await fetchFromPerplexity(question, marks, keys.perplexity);
+    if (answer) return { answer, model: 'Perplexity' };
+  }
 
-app.post('/pdf', async (req, res) => {
-  const { answers, subject } = req.body;
+  return { answer: '❌ Answer generation failed.', model: 'none' };
+};
 
-  const doc = new PDFDocument();
-  const bufferStream = new stream.PassThrough();
-  res.setHeader('Content-disposition', `attachment; filename=${subject || 'GeneratedAnswers'}.pdf`);
-  res.setHeader('Content-type', 'application/pdf');
-  doc.pipe(bufferStream);
+app.post('/', async (req, res) => {
+  const { questions, marks, subject, geminiKey, perplexityKey } = req.body;
 
-  doc.fontSize(20).text(`Subject: ${subject || "Untitled"}`, { align: 'center' });
-  doc.moveDown();
+  if (!questions || !Array.isArray(questions)) {
+    return res.status(400).json({ error: 'Invalid questions input' });
+  }
 
-  answers.forEach((item, i) => {
-    doc.fontSize(14).fillColor('black').text(`Q${i + 1}: ${item.question}`, { bold: true });
-    doc.moveDown(0.5);
-    doc.fontSize(12).fillColor('gray').text(item.answer);
-    doc.moveDown(1.5);
+  const answers = [];
 
-    // Watermark
-    doc.fillColor('lightgray').fontSize(40).opacity(0.2)
-      .text('Generated by SahilCodeLab', {
-        align: 'center',
-        rotate: 0
-      });
-    doc.opacity(1);
-    doc.addPage();
+  for (const question of questions) {
+    const result = await generateAnswer(question, marks, {
+      gemini: geminiKey || DEFAULT_GEMINI_API_KEY,
+      perplexity: perplexityKey || DEFAULT_PERPLEXITY_API_KEY,
+    });
+
+    answers.push({ question, answer: result.answer, model: result.model });
+  }
+
+  // If no subject — just return preview
+  if (!subject) return res.json(answers);
+
+  // Create PDF
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage();
+  const { width, height } = page.getSize();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+  let y = height - 50;
+  answers.forEach((item, index) => {
+    const qText = `Q${index + 1}: ${item.question}`;
+    const aText = `Ans: ${item.answer}`;
+    const modelText = `Model: ${item.model}`;
+    const lines = [qText, aText, modelText, ''];
+    lines.forEach(line => {
+      if (y < 60) {
+        page = pdfDoc.addPage();
+        y = height - 50;
+      }
+      page.drawText(line, { x: 50, y, size: 10, font });
+      y -= 20;
+    });
   });
 
-  doc.end();
-  bufferStream.on("data", (chunk) => res.write(chunk));
-  bufferStream.on("end", () => res.end());
+  // Watermark
+  const watermark = 'Generated by SahilCodeLab';
+  page.drawText(watermark, {
+    x: width / 2 - font.widthOfTextAtSize(watermark, 10) / 2,
+    y: 30,
+    size: 10,
+    font,
+    color: rgb(0.5, 0.5, 0.5),
+  });
+
+  const pdfBytes = await pdfDoc.save();
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${subject}.pdf"`);
+  res.send(pdfBytes);
 });
 
 app.listen(PORT, () => {
